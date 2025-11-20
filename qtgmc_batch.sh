@@ -1,174 +1,238 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env sh
+# qtgmc_batch.sh — POSIX sh, macOS/Linux
+# Modes:
+#   dvd  <disc_id|/dev/...> <rip_dir> <export_dir> [--min-minutes N] [--tff true|false] [--dual-mono|--mono-from-left|--mono-from-right]
+#   file <input_file>       <export_dir>          [--tff true|false] [audio flags...]
+#   dir  <input_dir>        <export_dir>          [--tff true|false] [audio flags...]
+set -eu
 
-# ---- Config (override via env) ----------------------------------------------
+# ---------- helpers ----------
+die(){ printf >&2 "xx %s\n" "$*"; exit 1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+abspath(){ python3 - "$1" <<'PY'
+import os,sys; print(os.path.abspath(sys.argv[1]))
+PY
+}
+
+# temp file (BSD/GNU mktemp)
+: "${TMPDIR:=/tmp}"
+mkvpy() { mktemp "${TMPDIR%/}/qtgmc_vpy.XXXXXXXX.vpy"; }
+
+# threads: VS defaults to num CPU; allow override
 : "${VS_THREADS:=$(python3 - <<'PY'
-import subprocess
-try:
-    n = int(subprocess.check_output(["sysctl","-n","hw.ncpu"]).strip())
-except Exception:
-    n = 4
-print(max(2, n-2))
+import os, multiprocessing as m
+print(max(1, min(16, (m.cpu_count() or 1)-0)))  # a cautious default
 PY
 )}"
 
-: "${FFMPEG_V_BITRATE:=40M}"     # for h264_videotoolbox
-: "${FFMPEG_V_MAXRATE:=50M}"
-: "${FFMPEG_V_BUFSIZE:=80M}"
-: "${FFMPEG_A_BITRATE:=192k}"
-
-# If you know the tape/clip is actually BFF, export TFF=false
-: "${TFF:=true}"
-
-# Duplicate left channel to both if you know one side is dead (set to 1 to enable)
-: "${DUP_LEFT_TO_STEREO:=0}"
-
-# Paths to templates (adjust if you keep them elsewhere)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TMPL_DV="${SCRIPT_DIR}/DVTapes_411.vpy"
-TMPL_GEN="${SCRIPT_DIR}/Interlaced_Generic.vpy"
-
-# ---- Helpers ----------------------------------------------------------------
-die(){ echo "xx $*" >&2; exit 1; }
-
-need() { command -v "$1" >/dev/null 2>&1 || die "Missing tool: $1"; }
-
-abs() {
-  python3 - <<'PY' "$1"
-import os,sys
-print(os.path.abspath(sys.argv[1]))
-PY
-}
-
-probe_json() {
-  ffprobe -hide_banner -v error -print_format json -show_streams -show_format -- "$1"
-}
-
-pick_matrix() {
-  # crude SD/HD matrix detector from WxH (used only for logging here)
-  local w="$1" h="$2"
-  if [ "$w" -le 720 ] && [ "$h" -le 576 ]; then
-    echo "470bg"
-  else
-    echo "709"
-  fi
-}
-
-# ---- Checks -----------------------------------------------------------------
-need vspipe
-need ffmpeg
-need ffprobe
-[ -f "$TMPL_DV" ]  || die "Missing template: $TMPL_DV"
-[ -f "$TMPL_GEN" ] || die "Missing template: $TMPL_GEN"
-
-# ---- Usage ------------------------------------------------------------------
-usage() {
-  cat <<USAGE
+# optional audio flags → ffmpeg -af
+audio_afilt=""
+case "${1-}" in
+  --help|-h|'') cat <<USAGE
 Usage:
-  $(basename "$0") file <input_path> <output_dir>
+  $0 dvd  disc:0           /path/to/_dvd_rips  /path/to/_exports [--min-minutes 20] [--tff true|false] [--dual-mono|--mono-from-left|--mono-from-right]
+  $0 file /path/to/input   /path/to/_exports   [--tff true|false] [audio flags...]
+  $0 dir  /path/to/folder  /path/to/_exports   [--tff true|false] [audio flags...]
 
-Example:
-  VS_THREADS=6 $(basename "$0") file "/Users/you/QTGMC/_dvd_rips/SC A1" "/Users/you/QTGMC/_exports/"
+Env:
+  VS_THREADS=N   (override VapourSynth worker threads)
 USAGE
+  exit 0;;
+esac
+
+# ---------- ffprobe-based sniff ----------
+probe_json(){
+  in="$1"
+  ffprobe -hide_banner -v error -select_streams v:0 \
+    -show_entries stream=pix_fmt,codec_name,width,height,field_order \
+    -of json -- "$in"
 }
 
-[ "${1:-}" = "file" ] || { usage; exit 1; }
-in="${2:?input path required}"
-outdir="${3:?output directory required}"
-
-[ -e "$in" ] || die "Input not found: $in"
-mkdir -p "$outdir"
-
-in_abs="$(abs "$in")"
-export VS_SRC="$in_abs"
-
-# ---- Inspect with ffprobe ---------------------------------------------------
-json="$(probe_json "$in_abs")" || die "ffprobe failed on: $in_abs"
-
-read -r codec pix_fmt width height channels <<<"$(
-python3 - <<'PY' "$json"
-import json,sys
-j=json.loads(sys.argv[1])
-v=[s for s in j.get("streams",[]) if s.get("codec_type")=="video"]
-a=[s for s in j.get("streams",[]) if s.get("codec_type")=="audio"]
-vc=v[0] if v else {}
-ac=a[0] if a else {}
-codec=vc.get("codec_name","")
-pix=vc.get("pix_fmt","")
-w=vc.get("width",0)
-h=vc.get("height",0)
-ch=ac.get("channels",0)
-print(codec, pix, w, h, ch)
+val_from_json(){ python3 - "$1" "$2" <<'PY'
+import sys,json
+j=json.load(sys.stdin)
+k=sys.argv[1]
+def get(d, ks):
+  for x in ks.split("."):
+    if isinstance(d, list): d=d[0] if d else {}
+    d=d.get(x,{})
+  return d if d else None
+v=get(j,k)
+print(v if v is not None else "")
 PY
-)"
+}
 
-[ -n "${codec:-}" ] || die "Could not parse video stream info from ffprobe."
+# ---------- template runner ----------
+# Requires DVTapes_411.vpy and Interlaced_Generic.vpy alongside this script or in CWD.
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+tmpl_dv="${script_dir}/DVTapes_411.vpy"
+tmpl_gen="${script_dir}/Interlaced_Generic.vpy"
+[ -f "$tmpl_dv" ]  || die "Missing template: $tmpl_dv"
+[ -f "$tmpl_gen" ] || die "Missing template: $tmpl_gen"
 
-# Choose template and TFF default for DV
-tmpl="$TMPL_GEN"
-tag="Interlaced_Generic"
-# normalize TFF for comparisons without using ${var,,}
-tff_norm="$(printf '%s' "$TFF" | tr '[:upper:]' '[:lower:]')"
-tff="$tff_norm"
-
-if [ "$codec" = "dvvideo" ] && [ "$pix_fmt" = "yuv411p" ]; then
-  tmpl="$TMPL_DV"
-  tag="DVTapes_411"
-  # DV NTSC in your captures behaves BFF historically; only trust user override if clean true/false
-  case "$tff_norm" in
-    true|false) tff="$tff_norm" ;;
-    *)          tff="false" ;;
+make_vpy(){
+  in="$1"; tag="$2"; tff="$3"
+  vpy="$(mkvpy)" || die "mktemp failed"
+  case "$tag" in
+    DVTapes_411)
+      # replace INPUT_DV.avi + TFF=X in DV template
+      sed "s|INPUT_DV\.avi|$in|g; s|TFF=True|TFF=${tff}|g" "$tmpl_dv" > "$vpy"
+      ;;
+    Interlaced_Generic)
+      sed "s|INPUT_FILE|$in|g; s|TFF=True|TFF=${tff}|g" "$tmpl_gen" > "$vpy"
+      ;;
+    *) die "unknown template tag: $tag" ;;
   esac
-else
-  case "$tff_norm" in
-    true|false) tff="$tff_norm" ;;
-    *)          tff="true" ;;  # default TFF for non-DV unless user overrides
+  printf %s "$vpy"
+}
+
+# audio helper flags
+apply_audio_flag(){
+  case "${1-}" in
+    --dual-mono)        audio_afilt='-af pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1' ;;
+    --mono-from-left)   audio_afilt='-af pan=stereo|c0=c0|c1=c0' ;;
+    --mono-from-right)  audio_afilt='-af pan=stereo|c0=c1|c1=c1' ;;
+    *) ;;
   esac
-fi
+}
 
-# ---- Build temp .vpy --------------------------------------------------------
-vpy_tmp="$(mktemp -t qtgmc_vpy.XXXXXX).vpy"
-trap 'rm -f "$vpy_tmp"' EXIT
+# ---------- core processing ----------
+process_one(){
+  in="$1"; outdir="$2"; forcetff="${3-}"
+  [ -f "$in" ] || die "Input file not found: $in"
 
-# Patch TFF and THREADS placeholders if present in templates
-sed \
-  -e "s|TFF=True|TFF=$tff|g" \
-  -e "s|TFF=False|TFF=$tff|g" \
-  -e "s|THREADS=[0-9][0-9]*|THREADS=$VS_THREADS|g" \
-  "$tmpl" > "$vpy_tmp"
+  js="$(probe_json "$in")" || die "ffprobe failed on: $in"
+  codec="$(printf %s "$js" | val_from_json 'streams.codec_name')"
+  pix="$(  printf %s "$js" | val_from_json 'streams.pix_fmt')"
+  w="$(    printf %s "$js" | val_from_json 'streams.width')"
+  h="$(    printf %s "$js" | val_from_json 'streams.height')"
 
-# ---- Output path ------------------------------------------------------------
-base="$(basename "$in_abs")"
-safe_base="$(printf '%s' "$base" | sed 's/[^A-Za-z0-9._-]/_/g')"
-out_path="${outdir%/}/${safe_base}_4k_hw.mp4"
+  # choose template & default TFF
+  tag="Interlaced_Generic"; tff_default="True"
+  [ "$codec" = "dvvideo" ] && tag="DVTapes_411" && tff_default="False"
+  [ "$pix" = "yuv411p" ]   && tag="DVTapes_411" && tff_default="False"
+  tff="${forcetff:-$tff_default}"
 
-# ---- Audio filter (optional mono/left dup) ----------------------------------
-AFILTER=""
-if [ "${DUP_LEFT_TO_STEREO}" = "1" ]; then
-  AFILTER="-af pan=stereo|c0=FL|c1=FL"
-fi
+  base="$(basename -- "$in")"
+  base="${base%.*}"
+  out="$outdir/${base}_4k_hw.mp4"
 
-# ---- Log --------------------------------------------------------------------
-matrix="$(pick_matrix "$width" "$height")"
-echo ">> [$tag] $in  (pix=$pix_fmt, codec=$codec, TFF=$tff, threads=$VS_THREADS, matrix=$matrix)"
+  printf ">> [%s] %s  (pix=%s, codec=%s, TFF=%s, threads=%s)\n" "$tag" "$in" "${pix:-?}" "${codec:-?}" "$(printf %s "$tff" | tr 'A-Z' 'a-z')" "$VS_THREADS"
 
-# ---- Run vspipe | ffmpeg ----------------------------------------------------
-set +e
-vspipe -c y4m "$vpy_tmp" - | \
-ffmpeg -hide_banner -y \
-  -f yuv4mpegpipe -i - \
-  -i "$in_abs" \
-  -map 0:v:0 -map 1:a:0 \
-  -vf "scale=3840:2160:flags=bicubic,format=yuv420p" \
-  -c:v h264_videotoolbox -b:v "$FFMPEG_V_BITRATE" -maxrate "$FFMPEG_V_MAXRATE" -bufsize "$FFMPEG_V_BUFSIZE" \
-  -c:a aac -b:a "$FFMPEG_A_BITRATE" \
-  ${AFILTER:+$AFILTER} \
-  -shortest \
-  -threads:v "$VS_THREADS" -threads:a 2 \
-  "$out_path"
-rc=$?
-set -e
+  vpy="$(make_vpy "$in" "$tag" "$tff")"
+  trap 'rm -f "$vpy"' EXIT INT HUP TERM
 
-[ "$rc" -eq 0 ] || die "ffmpeg failed"
-echo "✓ Done: $out_path"
+  # build ffmpeg audio args
+  aflags=""
+  if [ -n "$audio_afilt" ]; then
+    aflags="$audio_afilt"
+  fi
+
+  # run: VapourSynth → ffmpeg (vt hw encode + 4k upscale)
+  vspipe -y -c y4m "$vpy" - 2>/dev/null | \
+  ffmpeg -hide_banner -y -f yuv4mpegpipe -i - -i "$in" \
+    -map 0:v:0 -map 1:a:0 \
+    -vf "scale=3840:2160:flags=bicubic,format=yuv420p" \
+    -c:v h264_videotoolbox -b:v 40M -maxrate 50M -bufsize 80M \
+    -c:a aac -b:a 192k -shortest \
+    $aflags \
+    "$out" || die "ffmpeg failed"
+
+  echo "✔ wrote: $out"
+  rm -f "$vpy"
+  trap - EXIT INT HUP TERM
+}
+
+process_dir(){
+  indir="$1"; outdir="$2"; forcetff="${3-}"
+  found=0
+  # Process MKVs first (DVD rips), then common containers
+  for f in "$indir"/*.mkv "$indir"/*.mov "$indir"/*.avi "$indir"/*.mp4 "$indir"/*.mpg "$indir"/*.m2v; do
+    [ -f "$f" ] || continue
+    found=1
+    process_one "$f" "$outdir" "$forcetff"
+  done
+  [ "$found" -eq 1 ] || die "No media files found in: $indir"
+}
+
+# ---------- DVD ripping (MakeMKV) ----------
+find_makemkvcon(){
+  if have makemkvcon; then
+    echo "makemkvcon"; return 0
+  fi
+  # macOS app bundle path
+  if [ -x "/Applications/MakeMKV.app/Contents/MacOS/makemkvcon" ]; then
+    echo "/Applications/MakeMKV.app/Contents/MacOS/makemkvcon"; return 0
+  fi
+  return 1
+}
+
+rip_dvd(){
+  disc="$1"; ripdir="$2"; minmin="$3"
+  mmc="$(find_makemkvcon)" || die "makemkvcon not found. Install MakeMKV and its CLI."
+  mkdir -p "$ripdir"
+
+  # MakeMKV expects seconds for minlength
+  minsec=$(( ${minmin:-20} * 60 ))
+
+  echo ">> Ripping all titles ≥${minmin:-20} min to $ripdir ..."
+  # Common, quiet-ish invocation; progress on stdout, auto-accepts existing files by unique names.
+  # If overwrite prompts happen in your setup, pre-clean the target or add a --force flag on your side.
+  "$mmc" mkv "$disc" all "$ripdir" --minlength="$minsec" --progress=-stdout || die "MakeMKV rip failed"
+
+  echo ">> Rip complete."
+}
+
+# ---------- parse & run ----------
+mode="$1"; shift
+
+# peel out optional flags (any mode)
+force_tff=""
+min_minutes=""
+audio_flag=""
+rest=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --tff)
+      [ $# -ge 2 ] || die "--tff requires true|false"
+      force_tff="$2"; shift 2;;
+    --min-minutes)
+      [ $# -ge 2 ] || die "--min-minutes requires a number"
+      min_minutes="$2"; shift 2;;
+    --dual-mono|--mono-from-left|--mono-from-right)
+      audio_flag="$1"; shift 1;;
+    --) shift; break;;
+    -*)
+      die "Unknown flag: $1";;
+    *)
+      rest="$rest $1"; shift 1;;
+  esac
+done
+# apply audio flag if set
+[ -n "${audio_flag:-}" ] && apply_audio_flag "$audio_flag"
+
+set -- $rest
+
+case "$mode" in
+  dvd)
+    [ $# -ge 3 ] || die "dvd requires: <disc_id|/dev/...> <rip_dir> <export_dir> [flags]"
+    disc="$1"; ripdir="$(abspath "$2")"; outdir="$(abspath "$3")"
+    mkdir -p "$ripdir" "$outdir"
+    rip_dvd "$disc" "$ripdir" "${min_minutes:-20}"
+    process_dir "$ripdir" "$outdir" "$force_tff"
+    ;;
+  file)
+    [ $# -ge 2 ] || die "file requires: <input_file> <export_dir> [flags]"
+    in="$(abspath "$1")"; outdir="$(abspath "$2")"; mkdir -p "$outdir"
+    process_one "$in" "$outdir" "$force_tff"
+    ;;
+  dir)
+    [ $# -ge 2 ] || die "dir requires: <input_dir> <export_dir> [flags]"
+    indir="$(abspath "$1")"; outdir="$(abspath "$2")"; mkdir -p "$outdir"
+    process_dir "$indir" "$outdir" "$force_tff"
+    ;;
+  *)
+    die "unknown mode: $mode"
+    ;;
+esac
 

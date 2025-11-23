@@ -1,254 +1,238 @@
-#!/usr/bin/env zsh
-# QTGMC batcher for single file / directory / DVD rips (MakeMKV)
-# Requires: vapoursynth, vspipe, ffmpeg, ffprobe (+ optional makemkvcon)
+#!/usr/bin/env sh
+# qtgmc_batch.sh — POSIX sh, macOS/Linux
+# Modes:
+#   dvd  <disc_id|/dev/...> <rip_dir> <export_dir> [--min-minutes N] [--tff true|false] [--dual-mono|--mono-from-left|--mono-from-right]
+#   file <input_file>       <export_dir>          [--tff true|false] [audio flags...]
+#   dir  <input_dir>        <export_dir>          [--tff true|false] [audio flags...]
+set -eu
 
-# Re-exec under zsh if someone invoked via sh/bash
-if [[ -z ${ZSH_VERSION-} ]]; then exec zsh "$0" "$@"; fi
+# ---------- helpers ----------
+die(){ printf >&2 "xx %s\n" "$*"; exit 1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+abspath(){ python3 - "$1" <<'PY'
+import os,sys; print(os.path.abspath(sys.argv[1]))
+PY
+}
 
-# shell safety
-set -e
-set -u
-set -o pipefail 2>/dev/null || true
-setopt extended_glob
+# temp file (BSD/GNU mktemp)
+: "${TMPDIR:=/tmp}"
+mkvpy() { mktemp "${TMPDIR%/}/qtgmc_vpy.XXXXXXXX.vpy"; }
 
-# -------------------------
-# Defaults (override with env)
-# -------------------------
-MODE=${MODE:-auto}              # auto|dv|generic
-VIDEO_MODE=${VIDEO_MODE:-yt}    # yt|prores
-UPSCALE=${UPSCALE:-2160}        # 2160|1080|none (yt mode only)
-PAD_16_9=${PAD_16_9:-0}         # 1 = pillarbox to 3840x2160 when UPSCALE=2160
-ENCODER=${ENCODER:-vtb}        # x264|vtb
-OUTDIR=${OUTDIR:-./_exports}
-PRESET=${PRESET:-Fast}          # QTGMC preset
-KEEP_TMP=${KEEP_TMP:-0}         # 1 to keep generated .vpy
-KEEP_FFINDEX=${KEEP_FFINDEX:-0} # 1 to keep ffms2 .ffindex files
-MAKEMKVCON=${MAKEMKVCON:-/Applications/MakeMKV.app/Contents/MacOS/makemkvcon}
-CLEAN_RIP=1                # delete ripout even if you supplied a custom path
+# threads: VS defaults to num CPU; allow override
+: "${VS_THREADS:=$(python3 - <<'PY'
+import os, multiprocessing as m
+print(max(1, min(16, (m.cpu_count() or 1)-0)))  # a cautious default
+PY
+)}"
 
-die(){ print -r -- "Error: $*" >&2; exit 1; }
-need(){ whence -p "$1" >/dev/null || die "Missing dependency: $1"; }
+# optional audio flags → ffmpeg -af
+audio_afilt=""
+case "${1-}" in
+  --help|-h|'') cat <<USAGE
+Usage:
+  $0 dvd  disc:0           /path/to/_dvd_rips  /path/to/_exports [--min-minutes 20] [--tff true|false] [--dual-mono|--mono-from-left|--mono-from-right]
+  $0 file /path/to/input   /path/to/_exports   [--tff true|false] [audio flags...]
+  $0 dir  /path/to/folder  /path/to/_exports   [--tff true|false] [audio flags...]
 
-need vspipe
-need ffmpeg
-need ffprobe
+Env:
+  VS_THREADS=N   (override VapourSynth worker threads)
+USAGE
+  exit 0;;
+esac
 
-# locate templates (next to this script)
-here=${0:A:h}
-tmpl_dv="$here/DVTapes_411.vpy.tmpl"
-tmpl_gen="$here/Interlaced_Generic.vpy.tmpl"
-[[ -f $tmpl_dv && -f $tmpl_gen ]] || die "Missing template .vpy files beside script."
+# ---------- ffprobe-based sniff ----------
+probe_json(){
+  in="$1"
+  ffprobe -hide_banner -v error -select_streams v:0 \
+    -show_entries stream=pix_fmt,codec_name,width,height,field_order \
+    -of json -- "$in"
+}
 
-# ---------- ffprobe helpers ----------
-probe_field_order(){ ffprobe -v error -select_streams v:0 -show_entries stream=field_order -of default=nw=1:nk=1 "$1" 2>/dev/null || true }
-probe_pix_fmt(){    ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt     -of default=nw=1:nk=1 "$1" 2>/dev/null || true }
-probe_codec(){      ffprobe -v error -select_streams v:0 -show_entries stream=codec_name  -of default=nw=1:nk=1 "$1" 2>/dev/null || true }
-probe_dim(){        ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x "$1" 2>/dev/null || true }
+val_from_json(){ python3 - "$1" "$2" <<'PY'
+import sys,json
+j=json.load(sys.stdin)
+k=sys.argv[1]
+def get(d, ks):
+  for x in ks.split("."):
+    if isinstance(d, list): d=d[0] if d else {}
+    d=d.get(x,{})
+  return d if d else None
+v=get(j,k)
+print(v if v is not None else "")
+PY
+}
 
-infer_tff(){ # map ffprobe field_order -> True/False
-  local fo="$1" def="${2:-True}"
-  case "$fo" in
-    tt|tb) print -r -- "True"  ;;
-    bb|bt) print -r -- "False" ;;
-    *)     print -r -- "$def"  ;;
+# ---------- template runner ----------
+# Requires DVTapes_411.vpy and Interlaced_Generic.vpy alongside this script or in CWD.
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+tmpl_dv="${script_dir}/DVTapes_411.vpy"
+tmpl_gen="${script_dir}/Interlaced_Generic.vpy"
+[ -f "$tmpl_dv" ]  || die "Missing template: $tmpl_dv"
+[ -f "$tmpl_gen" ] || die "Missing template: $tmpl_gen"
+
+make_vpy(){
+  in="$1"; tag="$2"; tff="$3"
+  vpy="$(mkvpy)" || die "mktemp failed"
+  case "$tag" in
+    DVTapes_411)
+      # replace INPUT_DV.avi + TFF=X in DV template
+      sed "s|INPUT_DV\.avi|$in|g; s|TFF=True|TFF=${tff}|g" "$tmpl_dv" > "$vpy"
+      ;;
+    Interlaced_Generic)
+      sed "s|INPUT_FILE|$in|g; s|TFF=True|TFF=${tff}|g" "$tmpl_gen" > "$vpy"
+      ;;
+    *) die "unknown template tag: $tag" ;;
+  esac
+  printf %s "$vpy"
+}
+
+# audio helper flags
+apply_audio_flag(){
+  case "${1-}" in
+    --dual-mono)        audio_afilt='-af pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1' ;;
+    --mono-from-left)   audio_afilt='-af pan=stereo|c0=c0|c1=c0' ;;
+    --mono-from-right)  audio_afilt='-af pan=stereo|c0=c1|c1=c1' ;;
+    *) ;;
   esac
 }
 
-select_template_and_tff(){ # echo "tmpl|tff|chosen|pix|codec|fo|dims"
-  local in="$1"
-  local pix="$(probe_pix_fmt "$in" | tr '[:upper:]' '[:lower:]')"
-  local codec="$(probe_codec "$in" | tr '[:upper:]' '[:lower:]')"
-  local fo="$(probe_field_order "$in")"
-  local dims="$(probe_dim "$in")"
-  local tmpl tff chosen
-  if [[ "$MODE" == "dv" || "$pix" == "yuv411p" || "$codec" == "dvvideo" ]]; then
-    tff="$(infer_tff "$fo" "False")"; tmpl="$tmpl_dv";  chosen="DV"
-  else
-    tff="$(infer_tff "$fo" "True")";  tmpl="$tmpl_gen"; chosen="GENERIC"
-  fi
-  print -r -- "$tmpl|$tff|$chosen|$pix|$codec|$fo|$dims"
-}
-
-make_vpy(){ # fill __INPUT__/__TFF__/__PRESET__
-  local in="$1" out="$2" tmpl="$3" tff="$4"
-  # escape & and \ for sed replacement
-  local esc_in; esc_in="$(printf '%s' "$in" | sed 's/[&\\]/\\&/g')"
-  sed -e "s|__INPUT__|$esc_in|g" \
-      -e "s|__TFF__|$tff|g" \
-      -e "s|__PRESET__|$PRESET|g" "$tmpl" > "$out"
-}
-
-cleanup_indexes(){
-  local in="$1"
-  [[ "$KEEP_FFINDEX" == "1" ]] && return 0
-  local idx="${in}.ffindex"
-  [[ -f "$idx" ]] && rm -f -- "$idx"
-}
-
+# ---------- core processing ----------
 process_one(){
-  local in="$1"
-  [[ -f "$in" ]] || { print -r -- "Skip (not a file): $in"; return; }
+  in="$1"; outdir="$2"; forcetff="${3-}"
+  [ -f "$in" ] || die "Input file not found: $in"
 
-  local meta tmpl tff chosen pix codec fo dims
-  meta="$(select_template_and_tff "$in")"
-  IFS="|" read -r tmpl tff chosen pix codec fo dims <<<"$meta"
+  js="$(probe_json "$in")" || die "ffprobe failed on: $in"
+  codec="$(printf %s "$js" | val_from_json 'streams.codec_name')"
+  pix="$(  printf %s "$js" | val_from_json 'streams.pix_fmt')"
+  w="$(    printf %s "$js" | val_from_json 'streams.width')"
+  h="$(    printf %s "$js" | val_from_json 'streams.height')"
 
-  local base="${in:t:r}"
-  local tmpvpy; tmpvpy="$(mktemp -t qtgmc_XXXXXX.vpy)"
-  make_vpy "$in" "$tmpvpy" "$tmpl" "$tff"
+  # choose template & default TFF
+  tag="Interlaced_Generic"; tff_default="True"
+  [ "$codec" = "dvvideo" ] && tag="DVTapes_411" && tff_default="False"
+  [ "$pix" = "yuv411p" ]   && tag="DVTapes_411" && tff_default="False"
+  tff="${forcetff:-$tff_default}"
 
-  print -r -- ">> [$chosen] $in  (pix=$pix, codec=$codec, field_order=$fo, dims=$dims, TFF=$tff)"
-  mkdir -p -- "$OUTDIR"
+  base="$(basename -- "$in")"
+  base="${base%.*}"
+  out="$outdir/${base}_4k_hw.mp4"
 
-  # Square pixels first, then scale by height, optional pillarbox, then 420
-  local vfilter="scale=round(iw*sar/2)*2:ih,setsar=1"
-  if [[ "$VIDEO_MODE" == "yt" && "$UPSCALE" != "none" ]]; then
-    vfilter+=",scale=-2:${UPSCALE}:flags=bicubic"
-    if [[ "$PAD_16_9" == "1" && "$UPSCALE" == "2160" ]]; then
-      vfilter+=",pad=3840:2160:(ow-iw)/2:(oh-ih)/2"
-    fi
+  printf ">> [%s] %s  (pix=%s, codec=%s, TFF=%s, threads=%s)\n" "$tag" "$in" "${pix:-?}" "${codec:-?}" "$(printf %s "$tff" | tr 'A-Z' 'a-z')" "$VS_THREADS"
+
+  vpy="$(make_vpy "$in" "$tag" "$tff")"
+  trap 'rm -f "$vpy"' EXIT INT HUP TERM
+
+  # build ffmpeg audio args
+  aflags=""
+  if [ -n "$audio_afilt" ]; then
+    aflags="$audio_afilt"
   fi
-  vfilter+=",format=yuv420p"
 
-  local out
-  case "$VIDEO_MODE" in
-    prores)
-      out="$OUTDIR/${base}_prores.mov"
-      vspipe -c y4m "$tmpvpy" - | ffmpeg -hide_banner -y \
-        -f yuv4mpegpipe -i - -i "$in" \
-        -map 0:v:0 -map 1:a:0 \
-        -c:v prores_ks -profile:v 3 -pix_fmt yuv422p10le \
-        -c:a pcm_s16le -shortest "$out"
-      ;;
-    yt)
-      out="$OUTDIR/${base}_yt.mp4"
-      if [[ "$ENCODER" == "vtb" ]]; then
-        vspipe -c y4m "$tmpvpy" - | ffmpeg -hide_banner -y \
-          -f yuv4mpegpipe -i - -i "$in" \
-          -map 0:v:0 -map 1:a:0 \
-          -filter:v "$vfilter" \
-          -c:v h264_videotoolbox -b:v 40M -maxrate 50M -bufsize 80M \
-          -color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv \
-          -c:a aac -b:a 192k -movflags +faststart -shortest "$out"
-      else
-        vspipe -c y4m "$tmpvpy" - | ffmpeg -hide_banner -y \
-          -f yuv4mpegpipe -i - -i "$in" \
-          -map 0:v:0 -map 1:a:0 \
-          -filter:v "$vfilter" \
-          -c:v libx264 -preset slow -crf 16 -pix_fmt yuv420p \
-          -color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv \
-          -c:a aac -b:a 192k -movflags +faststart -shortest "$out"
-      fi
-      ;;
-    *) die "Unknown VIDEO_MODE: $VIDEO_MODE" ;;
-  esac
+  # run: VapourSynth → ffmpeg (vt hw encode + 4k upscale)
+  vspipe -y -c y4m "$vpy" - 2>/dev/null | \
+  ffmpeg -hide_banner -y -f yuv4mpegpipe -i - -i "$in" \
+    -map 0:v:0 -map 1:a:0 \
+    -vf "scale=3840:2160:flags=bicubic,format=yuv420p" \
+    -c:v h264_videotoolbox -b:v 40M -maxrate 50M -bufsize 80M \
+    -c:a aac -b:a 192k -shortest \
+    $aflags \
+    "$out" || die "ffmpeg failed"
 
-  # tidy
-  [[ "$KEEP_TMP" == "1" ]] || rm -f -- "$tmpvpy"
-  cleanup_indexes "$in"
-  print -r -- "   -> $out"
+  echo "✔ wrote: $out"
+  rm -f "$vpy"
+  trap - EXIT INT HUP TERM
 }
 
 process_dir(){
-  local d="$1"
-  setopt null_glob
-  for f in "$d"/*.(mkv|mpg|vob|avi|mov|mp4)(N); do
-    process_one "$f"
+  indir="$1"; outdir="$2"; forcetff="${3-}"
+  found=0
+  # Process MKVs first (DVD rips), then common containers
+  for f in "$indir"/*.mkv "$indir"/*.mov "$indir"/*.avi "$indir"/*.mp4 "$indir"/*.mpg "$indir"/*.m2v; do
+    [ -f "$f" ] || continue
+    found=1
+    process_one "$f" "$outdir" "$forcetff"
   done
-  unsetopt null_glob
+  [ "$found" -eq 1 ] || die "No media files found in: $indir"
 }
 
-rip_dvd_and_process(){
-  # dvd [source] [ripout] [outdir]
-  local source="${1:-disc:0}"
-  local ripout_arg="${2:-}"
-  local outdir_override="${3:-}"
-
-  [[ -n "$outdir_override" ]] && OUTDIR="$outdir_override"
-  [[ -x "$MAKEMKVCON" ]] || die "makemkvcon not found at '$MAKEMKVCON' (set MAKEMKVCON=...)"
-
-  # Decide where to rip:
-  # - If caller gave a ripout path => use it; delete only if CLEAN_RIP=1
-  # - If not given => create a unique temp dir and auto-delete after
-  local ripout cleanup_ripout=0
-  if [[ -n "$ripout_arg" ]]; then
-    ripout="$ripout_arg"
-    [[ "${CLEAN_RIP:-auto}" == "1" ]] && cleanup_ripout=1
-    mkdir -p -- "$ripout"
-  else
-    ripout="$(mktemp -d -t qtgmc_rip_XXXXXX)"
-    cleanup_ripout=1
+# ---------- DVD ripping (MakeMKV) ----------
+find_makemkvcon(){
+  if have makemkvcon; then
+    echo "makemkvcon"; return 0
   fi
-
-  print -r -- ">> Ripping all titles ≥20 min to $ripout ..."
-
-  # Build MakeMKV source spec; switch to disc:N if VIDEO_TS path is on a read-only optical volume
-  local srcspec=""
-  if [[ "$source" == disc:* ]]; then
-    srcspec="$source"
-  elif [[ -f "$source" && "${source:e:l}" == "iso" ]]; then
-    srcspec="iso:$source"
-  elif [[ -d "$source" && ( -f "$source/VIDEO_TS.IFO" || "$source" == *"VIDEO_TS"* ) ]]; then
-    if [[ ! -w "$source" ]]; then
-      local discnum="${DISC:-0}"
-      print -r -- ">> Detected read-only optical volume; switching to disc:$discnum"
-      srcspec="disc:$discnum"
-    else
-      srcspec="file:$source"
-    fi
-  else
-    die "Unrecognized DVD source: $source (use disc:0, /path/to/VIDEO_TS, or /path/to/disc.iso)"
+  # macOS app bundle path
+  if [ -x "/Applications/MakeMKV.app/Contents/MacOS/makemkvcon" ]; then
+    echo "/Applications/MakeMKV.app/Contents/MacOS/makemkvcon"; return 0
   fi
-
-  # Non-interactive ripping (no prompts), keep titles ≥ 20 minutes
-  "$MAKEMKVCON" --robot --minlength=1200 mkv "$srcspec" all "$ripout"
-
-  print -r -- ">> Processing ripped MKVs from $ripout ..."
-  process_dir "$ripout"
-
-  if (( cleanup_ripout )); then
-    print -r -- ">> Cleaning temp rip dir $ripout"
-    rm -rf -- "$ripout"
-  else
-    print -r -- ">> Keeping rip dir $ripout (set CLEAN_RIP=1 to auto-delete)"
-  fi
+  return 1
 }
 
-usage(){
-cat <<'EOF'
-Usage:
-  qtgmc_batch.zsh file <input>                          # process single file
-  qtgmc_batch.zsh dir  <folder>                         # process all mkv/mpg/vob/avi/mov/mp4 in folder
-    qtgmc_batch.zsh dvd [source] [ripout] [outdir]        # MakeMKV -> MKVs -> process
-    source : disc:0 (default), /path/to/VIDEO_TS, or /path/to/disc.iso
-    ripout : temp dir auto-created & auto-deleted if omitted; if given, kept unless CLEAN_RIP=1
-    outdir : exports folder (overrides OUTDIR)
+rip_dvd(){
+  disc="$1"; ripdir="$2"; minmin="$3"
+  mmc="$(find_makemkvcon)" || die "makemkvcon not found. Install MakeMKV and its CLI."
+  mkdir -p "$ripdir"
 
-Env:
-  MODE=auto|dv|generic
-  VIDEO_MODE=yt|prores
-  UPSCALE=2160|1080|none
-  PAD_16_9=1
-  ENCODER=x264|vtb
-  OUTDIR=/path/to/exports
-  PRESET=Fast|Medium|...
-  KEEP_TMP=1                 # keep temp .vpy
-  KEEP_FFINDEX=1             # keep ffms2 .ffindex
-  MAKEMKVCON=/Applications/MakeMKV.app/Contents/MacOS/makemkvcon
+  # MakeMKV expects seconds for minlength
+  minsec=$(( ${minmin:-20} * 60 ))
 
-Examples:
-  ENCODER=vtb UPSCALE=2160 ./qtgmc_batch.zsh file "/Users/you/SC A1"
-  PAD_16_9=1 ENCODER=x264   ./qtgmc_batch.zsh dir  "/Volumes/Rips"
-  ./qtgmc_batch.zsh dvd "/Volumes/DVD Video Recording/VIDEO_TS" "/tmp/_dvd_rips" "$HOME/Documents/QTGMC/_exports"
-  ./qtgmc_batch.zsh dvd disc:0 "/tmp/_dvd_rips" "$HOME/Documents/QTGMC/_exports"
-EOF
+  echo ">> Ripping all titles ≥${minmin:-20} min to $ripdir ..."
+  # Common, quiet-ish invocation; progress on stdout, auto-accepts existing files by unique names.
+  # If overwrite prompts happen in your setup, pre-clean the target or add a --force flag on your side.
+  "$mmc" mkv "$disc" all "$ripdir" --minlength="$minsec" --progress=-stdout || die "MakeMKV rip failed"
+
+  echo ">> Rip complete."
 }
 
-cmd="${1:-}"
-case "$cmd" in
-  file) [[ $# -ge 2 ]] || { usage; exit 1; }; process_one "$2" ;;
-  dir)  [[ $# -ge 2 ]] || { usage; exit 1; }; process_dir "$2" ;;
-  dvd)  rip_dvd_and_process "${2:-disc:0}" "${3:-/tmp/_dvd_rips}" "${4:-}" ;;
-  *)    usage; exit 1 ;;
+# ---------- parse & run ----------
+mode="$1"; shift
+
+# peel out optional flags (any mode)
+force_tff=""
+min_minutes=""
+audio_flag=""
+rest=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --tff)
+      [ $# -ge 2 ] || die "--tff requires true|false"
+      force_tff="$2"; shift 2;;
+    --min-minutes)
+      [ $# -ge 2 ] || die "--min-minutes requires a number"
+      min_minutes="$2"; shift 2;;
+    --dual-mono|--mono-from-left|--mono-from-right)
+      audio_flag="$1"; shift 1;;
+    --) shift; break;;
+    -*)
+      die "Unknown flag: $1";;
+    *)
+      rest="$rest $1"; shift 1;;
+  esac
+done
+# apply audio flag if set
+[ -n "${audio_flag:-}" ] && apply_audio_flag "$audio_flag"
+
+set -- $rest
+
+case "$mode" in
+  dvd)
+    [ $# -ge 3 ] || die "dvd requires: <disc_id|/dev/...> <rip_dir> <export_dir> [flags]"
+    disc="$1"; ripdir="$(abspath "$2")"; outdir="$(abspath "$3")"
+    mkdir -p "$ripdir" "$outdir"
+    rip_dvd "$disc" "$ripdir" "${min_minutes:-20}"
+    process_dir "$ripdir" "$outdir" "$force_tff"
+    ;;
+  file)
+    [ $# -ge 2 ] || die "file requires: <input_file> <export_dir> [flags]"
+    in="$(abspath "$1")"; outdir="$(abspath "$2")"; mkdir -p "$outdir"
+    process_one "$in" "$outdir" "$force_tff"
+    ;;
+  dir)
+    [ $# -ge 2 ] || die "dir requires: <input_dir> <export_dir> [flags]"
+    indir="$(abspath "$1")"; outdir="$(abspath "$2")"; mkdir -p "$outdir"
+    process_dir "$indir" "$outdir" "$force_tff"
+    ;;
+  *)
+    die "unknown mode: $mode"
+    ;;
 esac
 
